@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import ipaddress
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 Resolver = Callable[[str], Sequence[str]]
 
@@ -22,6 +25,40 @@ __all__ = [
     "validate_policy",
     "fetch_batch",
 ]
+
+_DOMAIN_LABEL = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def _normalize_host(host: Any) -> str | None:
+    """转小写并去掉一个末尾根点；无法规范化时返回 None。"""
+    if not isinstance(host, str):
+        return None
+    host = host.lower()
+    if host.endswith("."):
+        host = host[:-1]
+    if not host:
+        return None
+    return host
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_valid_domain(host: str) -> bool:
+    """域名字面校验：点分隔标签，每标签仅 ASCII 字母数字与连字符。"""
+    if not host or host.startswith(".") or host.endswith(".") or ".." in host:
+        return False
+    if any(ch.isspace() for ch in host):
+        return False
+    labels = host.split(".")
+    if len(host) > 253 or not labels:
+        return False
+    return all(_DOMAIN_LABEL.fullmatch(label) for label in labels)
 
 
 def parse_target(url: str) -> dict[str, Any]:
@@ -38,7 +75,51 @@ def parse_target(url: str) -> dict[str, Any]:
 
     该函数只解析语法，不判断协议是否允许、端口是否为 443，也不查询 DNS。
     """
-    raise NotImplementedError
+    if not isinstance(url, str) or not url:
+        raise ValueError("invalid_target")
+
+    try:
+        parts = urlsplit(url)
+        explicit_port = parts.port
+    except ValueError:
+        raise ValueError("invalid_target") from None
+
+    scheme = parts.scheme.lower()
+    if not scheme:
+        raise ValueError("invalid_target")
+
+    if explicit_port is not None and explicit_port not in range(1, 65536):
+        raise ValueError("invalid_target")
+
+    # file 等无 authority 的 URL 允许空 host；带 // 的分层 URL 必须有 host。
+    raw_host = parts.hostname
+    if raw_host is None:
+        if parts.netloc or scheme not in ("file",):
+            raise ValueError("invalid_target")
+        host = ""
+    else:
+        host = _normalize_host(raw_host)
+        if host is None:
+            raise ValueError("invalid_target")
+
+    if explicit_port is not None:
+        port: int | None = explicit_port
+    elif scheme == "https":
+        port = 443
+    elif scheme == "http":
+        port = 80
+    else:
+        port = None
+
+    path = parts.path or "/"
+
+    return {
+        "url": url,
+        "scheme": scheme,
+        "host": host,
+        "port": port,
+        "path": path,
+    }
 
 
 def host_allowed(host: str, allow: Sequence[str]) -> bool:
@@ -55,7 +136,38 @@ def host_allowed(host: str, allow: Sequence[str]) -> bool:
       调用方仍须执行地址校验。
     - 空值、畸形主机或畸形条目一律返回 False，不抛异常。
     """
-    raise NotImplementedError
+    target = _normalize_host(host)
+    if target is None:
+        return False
+    target_is_ip = _is_ip_literal(target)
+
+    for entry in allow:
+        normalized_entry = _normalize_host(entry)
+        if normalized_entry is None:
+            continue
+
+        if normalized_entry.startswith("*."):
+            # 缺陷 2 修复：通配条目不匹配裸域；IP 字面量不得命中通配。
+            if target_is_ip:
+                continue
+            suffix = normalized_entry[2:]
+            if not suffix or not _is_valid_domain(suffix):
+                continue
+            if not _is_valid_domain(target):
+                return False
+            if not target.endswith("." + suffix):
+                continue
+            # 后缀之前必须至少还有一个非空标签（裸域此时 prefix 为空，被拒）。
+            prefix = target[: -(len(suffix) + 1)]
+            if prefix:
+                return True
+            continue
+
+        # 缺陷 1 修复：普通条目只做完整相等比较，不做后缀/子串比较。
+        if normalized_entry == target:
+            return True
+
+    return False
 
 
 def address_blocked(ip: str) -> bool:
@@ -66,7 +178,20 @@ def address_blocked(ip: str) -> bool:
     ValueError，任何非全局单播地址都视为阻断。容差为 0，不允许把私网地址
     通过映射、缩写或网段近似放行。
     """
-    raise NotImplementedError
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        raise ValueError("invalid_address") from None
+
+    # 缺陷 4 修复：覆盖全部非公网类别，而非仅 10.0.0.0/8。
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_unspecified
+        or addr.is_multicast
+        or addr.is_reserved
+    )
 
 
 def resolve_and_check(
@@ -89,7 +214,43 @@ def resolve_and_check(
     invalid_address、blocked_address 或 denied_address。
     返回 host 与 addresses 两个键，addresses 为字符串元组。
     """
-    raise NotImplementedError
+    if not host_allowed(host, allow):
+        raise ValueError("host_not_allowed")
+
+    # 缺陷 5 修复的一部分：每次调用只解析一次，且绝不缓存、绝不复用。
+    raw_addresses = resolver(host)
+
+    deny_nets = []
+    for network in deny:
+        try:
+            deny_nets.append(ipaddress.ip_network(network, strict=False))
+        except ValueError:
+            raise ValueError("denied_address") from None
+
+    unique: list[str] = []
+    for raw in raw_addresses:
+        if raw in unique:
+            continue
+        if not isinstance(raw, str):
+            raise ValueError("invalid_address")
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            raise ValueError("invalid_address") from None
+
+        # 缺陷 3 修复：对解析出的每一个地址逐一做全量校验，全有或全无。
+        if address_blocked(raw):
+            raise ValueError("blocked_address")
+        if any(
+            addr.version == net.version and addr in net for net in deny_nets
+        ):
+            raise ValueError("denied_address")
+        unique.append(raw)
+
+    if not unique:
+        raise ValueError("empty_resolution")
+
+    return {"host": host, "addresses": tuple(unique)}
 
 
 def pinned_resolve(
@@ -112,7 +273,28 @@ def pinned_resolve(
     返回 url、scheme、host、port、path、addresses、pinned 七个键；
     addresses 为字符串元组，pinned 为其第一个元素。
     """
-    raise NotImplementedError
+    target = parse_target(url)
+
+    # 缺陷 7 修复：只允许 https，file 等协议在协议白名单处被挡下。
+    if target["scheme"] != "https":
+        raise ValueError("scheme_not_allowed")
+    # 缺陷 10 修复：只允许 443，其他显式/默认端口一律拒绝。
+    if target["port"] != 443:
+        raise ValueError("port_not_allowed")
+
+    checked = resolve_and_check(target["host"], resolver, allow, deny)
+
+    # 复制为不可变元组，切断与 resolver 返回列表的共享，防止外部数据变化。
+    addresses = tuple(checked["addresses"])
+    return {
+        "url": target["url"],
+        "scheme": target["scheme"],
+        "host": target["host"],
+        "port": target["port"],
+        "path": target["path"],
+        "addresses": addresses,
+        "pinned": addresses[0],
+    }
 
 
 def redirect_allowed(old: str, new: str, allow: Sequence[str]) -> bool:
@@ -127,7 +309,28 @@ def redirect_allowed(old: str, new: str, allow: Sequence[str]) -> bool:
     可以继续校验，不表示可以复用 old 的固定地址；调用方必须对 new 重新执行
     pinned_resolve。畸形输入返回 False。
     """
-    raise NotImplementedError
+    try:
+        old_target = parse_target(old)
+        new_target = parse_target(new)
+    except ValueError:
+        return False
+
+    if old_target["scheme"] != "https" or old_target["port"] != 443:
+        return False
+    if new_target["scheme"] != "https" or new_target["port"] != 443:
+        return False
+
+    # 缺陷 6 修复：重定向目标必须独立重新通过白名单，不沿用旧结论。
+    if not host_allowed(new_target["host"], allow):
+        return False
+
+    # IP 字面量即使显式在白名单中，命中禁止地址也必须拒绝。
+    if _is_ip_literal(new_target["host"]) and address_blocked(
+        new_target["host"]
+    ):
+        return False
+
+    return True
 
 
 def validate_policy(policy: Mapping[str, Any]) -> list[str]:
@@ -143,7 +346,31 @@ def validate_policy(policy: Mapping[str, Any]) -> list[str]:
     scheme_not_restricted；合法策略返回空列表。缺键按对应问题处理，
     不抛异常。
     """
-    raise NotImplementedError
+    issues: list[str] = []
+
+    if policy.get("check_resolved_addresses") is not True:
+        issues.append("resolved_addresses_not_checked")
+
+    # 缺陷 8 修复：把无限/不明确的重定向配置明确判为问题。
+    max_redirects = policy.get("max_redirects")
+    if (
+        max_redirects is None
+        or isinstance(max_redirects, bool)
+        or not isinstance(max_redirects, int)
+        or max_redirects < 0
+    ):
+        issues.append("unbounded_redirects")
+
+    schemes = policy.get("allowed_schemes")
+    normalized = set()
+    if isinstance(schemes, Sequence) and not isinstance(schemes, (str, bytes)):
+        normalized = {
+            item.lower() for item in schemes if isinstance(item, str)
+        }
+    if normalized != {"https"}:
+        issues.append("scheme_not_restricted")
+
+    return issues
 
 
 def fetch_batch(
@@ -164,4 +391,25 @@ def fetch_batch(
     返回 ok 与 rejected 两个键。ok 为 pinned 结果列表，rejected 为 url 与
     reason 的字典列表；两个列表各自保持输入顺序，一个 URL 只出现在一边。
     """
-    raise NotImplementedError
+    ok: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    if validate_policy(policy):
+        for url in urls:
+            rejected.append({"url": url, "reason": "invalid_policy"})
+        return {"ok": ok, "rejected": rejected}
+
+    allow = policy.get("allow_hosts", [])
+    deny = policy.get("deny_networks", [])
+
+    for url in urls:
+        # 缺陷 9 修复：每个 URL 独立走一遍 pinned_resolve，不维护、不复用
+        # 任何跨目标的解析缓存；resolver 因此对每个 URL 都被调用一次。
+        try:
+            result = pinned_resolve(url, resolver, allow, deny)
+        except ValueError as exc:
+            rejected.append({"url": url, "reason": exc.args[0]})
+        else:
+            ok.append(result)
+
+    return {"ok": ok, "rejected": rejected}
